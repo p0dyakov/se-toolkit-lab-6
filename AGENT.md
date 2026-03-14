@@ -1,78 +1,71 @@
-# Agent (Tasks 1-2)
+# Agent Architecture (Tasks 1-3)
 
-## Overview
+## What this agent does
 
-`agent.py` is a CLI documentation agent. It accepts a user question, interacts with an OpenAI-compatible model, and returns a single JSON object.
+`agent.py` is a CLI system agent for Lab 6. It accepts one natural-language question, calls an OpenAI-compatible LLM, executes tool calls, and prints one JSON object to stdout. The output contract is stable:
 
-Current output contract:
+- `answer` — final text answer.
+- `source` — file/section reference when documentation or source code was used (can be empty for pure runtime API answers).
+- `tool_calls` — trace of executed tools with arguments and raw result payload.
 
-- `answer` (string, required)
-- `source` (string, required for documentation answers; may be empty when not found)
-- `tool_calls` (array, required; contains executed tool calls)
+## Configuration model
 
-## LLM configuration
+All runtime config is environment-driven:
 
-The agent reads all LLM config from environment variables:
+- `LLM_API_KEY`, `LLM_API_BASE`, `LLM_MODEL` control the LLM backend.
+- `LMS_API_KEY` authenticates backend API requests from the `query_api` tool.
+- `AGENT_API_BASE_URL` selects API host for `query_api` (default `http://localhost:42002`).
 
-- `LLM_API_KEY`
-- `LLM_API_BASE`
-- `LLM_MODEL`
+No keys are hardcoded. For local development, `agent.py` loads `.env.agent.secret` and `.env` as convenience inputs, but exported shell variables always win.
 
-For local convenience, it loads `.env.agent.secret` and then `.env` without overriding already exported variables.
+## Agent loop
 
-## Agentic loop
+The agent uses a classic tool-calling loop:
 
-The agent implements a tool-calling loop:
+1. Build `messages` with system + user prompt and tool schemas.
+2. Send to LLM (`/chat/completions`).
+3. If `tool_calls` are returned, execute each tool and append `tool` messages.
+4. Repeat until the model returns normal content (final answer).
+5. Stop after `MAX_TOOL_CALLS` (10) to avoid infinite loops.
 
-1. Send system + user messages with tool schemas.
-2. If model returns tool calls:
-   - execute tools,
-   - append tool results as `tool` messages,
-   - continue.
-3. If model returns no tool calls:
-   - parse final answer and source,
-   - return JSON.
-4. Hard stop after 10 tool calls.
+This keeps behavior deterministic, debuggable, and safe for benchmark-style questions.
 
 ## Tools
 
 ### `read_file(path)`
 
-Reads file contents from repository root.
+Reads repository files. It enforces a project-root sandbox and blocks traversal outside the repo.
 
 ### `list_files(path)`
 
-Lists directory entries (newline-separated) from repository root.
+Lists directory entries under repository root with the same sandbox constraints.
 
-## Path security
+### `query_api(method, path, body?)`
 
-Both tools enforce a repository-root sandbox:
-
-- paths are resolved relative to project root;
-- path traversal outside repo is rejected;
-- `read_file` only reads files;
-- `list_files` only lists directories.
-
-## Run
-
-```bash
-uv run agent.py "How do you resolve a merge conflict?"
-```
-
-Example output:
+Sends authenticated HTTP requests to the LMS backend and returns a normalized JSON result:
 
 ```json
-{
-  "answer": "Edit the conflicted file, resolve markers, stage, and commit.",
-  "source": "wiki/git-workflow.md#resolving-merge-conflicts",
-  "tool_calls": [
-    {"tool": "list_files", "args": {"path": "wiki"}, "result": "..."},
-    {"tool": "read_file", "args": {"path": "wiki/git-workflow.md"}, "result": "..."}
-  ]
-}
+{"status_code": 200, "body": ...}
 ```
 
-## Testing
+The tool validates HTTP method, requires a leading slash in `path`, and injects `Authorization: Bearer <LMS_API_KEY>`.
 
-- Task 1 regression test validates subprocess JSON contract.
-- Task 2 tests mock LLM responses and validate tool usage (`read_file`, `list_files`) and source extraction.
+## Tool routing strategy in prompt
+
+The system prompt instructs the model to:
+
+- use `read_file` / `list_files` for documentation and source-code questions,
+- use `query_api` for runtime/data questions,
+- combine `query_api` + `read_file` for bug diagnosis tasks.
+
+This separation is important for benchmark correctness because several questions explicitly require specific tool usage.
+
+## Validation and regression coverage
+
+Regression tests include:
+
+- subprocess JSON contract test (Task 1),
+- documentation tool usage tests (Task 2),
+- system/data tool usage tests including `query_api` (Task 3).
+
+Current implementation is structured for iterative prompt/tool tuning against `run_eval.py` and the hidden autochecker questions.

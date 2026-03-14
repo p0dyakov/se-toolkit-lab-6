@@ -152,7 +152,76 @@ def _tools_schema() -> list[dict[str, Any]]:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_api",
+                "description": "Call the deployed LMS backend API endpoint.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "method": {
+                            "type": "string",
+                            "description": "HTTP method, e.g. GET or POST.",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "API path starting with /, e.g. /items/.",
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "Optional JSON string request body.",
+                        },
+                    },
+                    "required": ["method", "path"],
+                },
+            },
+        },
     ]
+
+
+def _query_api(method: str, path: str, body: str | None = None) -> str:
+    normalized_method = method.strip().upper()
+    if normalized_method not in {
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "HEAD",
+        "OPTIONS",
+    }:
+        return json.dumps({"status_code": 400, "body": f"Unsupported method: {method}"})
+
+    normalized_path = path.strip()
+    if not normalized_path.startswith("/"):
+        return json.dumps({"status_code": 400, "body": "Path must start with /"})
+
+    api_base = os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002").rstrip("/")
+    lms_key = os.environ.get("LMS_API_KEY", "").strip()
+    if not lms_key:
+        return json.dumps({"status_code": 401, "body": "Missing LMS_API_KEY"})
+
+    headers = {
+        "Authorization": f"Bearer {lms_key}",
+        "Accept": "application/json",
+    }
+    request_kwargs: dict[str, Any] = {}
+    if body:
+        try:
+            request_kwargs["json"] = json.loads(body)
+        except json.JSONDecodeError:
+            request_kwargs["content"] = body
+            headers["Content-Type"] = "application/json"
+
+    url = f"{api_base}{normalized_path}"
+    with httpx.Client(timeout=30.0) as client:
+        response = client.request(normalized_method, url, headers=headers, **request_kwargs)
+    try:
+        parsed_body: Any = response.json()
+    except json.JSONDecodeError:
+        parsed_body = response.text
+    return json.dumps({"status_code": response.status_code, "body": parsed_body})
 
 
 def _execute_tool(name: str, args: dict[str, Any]) -> str:
@@ -160,6 +229,12 @@ def _execute_tool(name: str, args: dict[str, Any]) -> str:
         return _read_file(str(args.get("path", "")))
     if name == "list_files":
         return _list_files(str(args.get("path", ".")))
+    if name == "query_api":
+        return _query_api(
+            method=str(args.get("method", "GET")),
+            path=str(args.get("path", "")),
+            body=str(args["body"]) if "body" in args and args["body"] is not None else None,
+        )
     return f"ERROR: Unknown tool: {name}"
 
 
@@ -189,8 +264,10 @@ def run_agent(question: str) -> dict[str, Any]:
         {
             "role": "system",
             "content": (
-                "You are a documentation agent for this repository. "
-                "Use list_files to discover files and read_file to read content. "
+                "You are a system agent for this repository and LMS backend. "
+                "Use list_files/read_file for wiki/source questions. "
+                "Use query_api for live backend/data/runtime questions. "
+                "For bug diagnosis, first query the API, then inspect source code. "
                 "Answer using repository facts only. "
                 "For the final response, return JSON with keys: answer, source. "
                 "Source must be a file path and optional anchor."
