@@ -1,4 +1,4 @@
-# Agent Architecture (Tasks 1-3)
+# Agent Architecture (Tasks 1-3 + Optional)
 
 ## What this agent does
 
@@ -69,3 +69,28 @@ Regression tests include:
 - system/data tool usage tests including `query_api` (Task 3).
 
 Current implementation is structured for iterative prompt/tool tuning against `run_eval.py` and the hidden autochecker questions.
+
+## Optional extensions implemented
+
+This version adds two reliability-oriented extensions from the optional task.
+
+### 1) LLM retry with exponential backoff
+
+`_chat_completion` now retries transient failures up to 3 attempts. Retries are triggered for:
+
+- HTTP `429` (rate limit),
+- HTTP `5xx` errors,
+- network-level `httpx.HTTPError`.
+
+Backoff delays grow as `0.5s -> 1.0s -> 2.0s` (bounded by retry count). This reduces flaky failures when the model provider is temporarily overloaded.
+
+### 2) In-run tool result cache
+
+`run_agent` now keeps a per-request in-memory cache keyed by `(tool_name, args-json)`. If the model repeats an identical tool call in the same run, the second execution returns instantly from cache instead of re-reading the same file or hitting the same API endpoint.
+
+`tool_calls` now includes:
+
+- `cache_hit: false` for first execution,
+- `cache_hit: true` for reused results.
+
+The cache is intentionally scoped to a single run (no cross-request persistence), which keeps behavior deterministic and avoids stale data across unrelated questions.

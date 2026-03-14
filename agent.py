@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ import httpx
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 MAX_TOOL_CALLS = 10
+MAX_LLM_RETRIES = 3
 
 
 def _load_env_files() -> None:
@@ -57,18 +59,36 @@ def _chat_completion(messages: list[dict[str, Any]], tools: list[dict[str, Any]]
         "temperature": 0,
     }
 
-    with httpx.Client(timeout=55.0) as client:
-        response = client.post(
-            f"{base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-        response.raise_for_status()
-        data = response.json()
-    return data
+    backoff_delays = [0.5, 1.0, 2.0]
+    last_error: Exception | None = None
+
+    for attempt in range(MAX_LLM_RETRIES):
+        try:
+            with httpx.Client(timeout=55.0) as client:
+                response = client.post(
+                    f"{base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                response.raise_for_status()
+                return response.json()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            retriable = status == 429 or status >= 500
+            last_error = exc
+            if not retriable or attempt == MAX_LLM_RETRIES - 1:
+                raise
+        except httpx.HTTPError as exc:
+            last_error = exc
+            if attempt == MAX_LLM_RETRIES - 1:
+                raise
+
+        time.sleep(backoff_delays[min(attempt, len(backoff_delays) - 1)])
+
+    raise RuntimeError(f"LLM request failed after retries: {last_error}")
 
 
 def _extract_message(data: dict[str, Any]) -> dict[str, Any]:
@@ -224,18 +244,29 @@ def _query_api(method: str, path: str, body: str | None = None) -> str:
     return json.dumps({"status_code": response.status_code, "body": parsed_body})
 
 
-def _execute_tool(name: str, args: dict[str, Any]) -> str:
+def _execute_tool(
+    name: str, args: dict[str, Any], cache: dict[str, str] | None = None
+) -> tuple[str, bool]:
+    cache_key = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
+    if cache is not None and cache_key in cache:
+        return cache[cache_key], True
+
     if name == "read_file":
-        return _read_file(str(args.get("path", "")))
-    if name == "list_files":
-        return _list_files(str(args.get("path", ".")))
-    if name == "query_api":
-        return _query_api(
+        result = _read_file(str(args.get("path", "")))
+    elif name == "list_files":
+        result = _list_files(str(args.get("path", ".")))
+    elif name == "query_api":
+        result = _query_api(
             method=str(args.get("method", "GET")),
             path=str(args.get("path", "")),
             body=str(args["body"]) if "body" in args and args["body"] is not None else None,
         )
-    return f"ERROR: Unknown tool: {name}"
+    else:
+        result = f"ERROR: Unknown tool: {name}"
+
+    if cache is not None:
+        cache[cache_key] = result
+    return result, False
 
 
 def _infer_source_from_tools(tool_calls_log: list[dict[str, Any]]) -> str:
@@ -298,6 +329,7 @@ def run_agent(question: str) -> dict[str, Any]:
     tools = _tools_schema()
     tool_calls_log: list[dict[str, Any]] = []
     tool_calls_count = 0
+    tool_cache: dict[str, str] = {}
 
     while True:
         data = _chat_completion(messages=messages, tools=tools)
@@ -335,9 +367,14 @@ def run_agent(question: str) -> dict[str, Any]:
             if not isinstance(parsed_args, dict):
                 parsed_args = {}
 
-            result = _execute_tool(tool_name, parsed_args)
+            result, from_cache = _execute_tool(tool_name, parsed_args, cache=tool_cache)
             tool_calls_log.append(
-                {"tool": tool_name, "args": parsed_args, "result": result}
+                {
+                    "tool": tool_name,
+                    "args": parsed_args,
+                    "result": result,
+                    "cache_hit": from_cache,
+                }
             )
             tool_calls_count += 1
             messages.append(
