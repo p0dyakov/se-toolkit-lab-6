@@ -238,7 +238,27 @@ def _execute_tool(name: str, args: dict[str, Any]) -> str:
     return f"ERROR: Unknown tool: {name}"
 
 
-def _parse_final_response(content: str) -> tuple[str, str]:
+def _infer_source_from_tools(tool_calls_log: list[dict[str, Any]]) -> str:
+    for call in reversed(tool_calls_log):
+        tool = str(call.get("tool", ""))
+        args = call.get("args", {})
+        if not isinstance(args, dict):
+            continue
+        if tool == "read_file":
+            path = str(args.get("path", "")).strip()
+            if path:
+                return path
+        if tool == "list_files":
+            path = str(args.get("path", ".")).strip() or "."
+            return path
+        if tool == "query_api":
+            path = str(args.get("path", "")).strip()
+            if path:
+                return f"API {path}"
+    return "agent-observation"
+
+
+def _parse_final_response(content: str, tool_calls_log: list[dict[str, Any]]) -> tuple[str, str]:
     stripped = (content or "").strip()
     if not stripped:
         return "", ""
@@ -248,10 +268,10 @@ def _parse_final_response(content: str) -> tuple[str, str]:
             answer = str(parsed.get("answer", "")).strip()
             source = str(parsed.get("source", "")).strip()
             if answer:
-                return answer, source
+                return answer, source or _infer_source_from_tools(tool_calls_log)
     except json.JSONDecodeError:
         pass
-    return stripped, ""
+    return stripped, _infer_source_from_tools(tool_calls_log)
 
 
 def run_agent(question: str) -> dict[str, Any]:
@@ -286,7 +306,7 @@ def run_agent(question: str) -> dict[str, Any]:
         tool_calls = message.get("tool_calls") or []
 
         if not tool_calls:
-            answer, source = _parse_final_response(str(assistant_text))
+            answer, source = _parse_final_response(str(assistant_text), tool_calls_log)
             return {"answer": answer, "source": source, "tool_calls": tool_calls_log}
 
         messages.append(
